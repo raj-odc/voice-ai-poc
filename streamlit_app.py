@@ -128,6 +128,6 @@ with tab2:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center'>
-    <p>Made with ❤️ by Your Team</p>
+    <p>Made with ❤️ by Selvaraj</p>
 </div>
 """, unsafe_allow_html=True)

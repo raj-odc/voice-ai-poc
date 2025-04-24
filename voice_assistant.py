@@ -23,7 +23,7 @@ class VoiceAssistant:
     def __init__(self):
         self.sample_rate = int(os.getenv("SAMPLE_RATE", 16000))
         self.chunk_size = int(os.getenv("CHUNK_SIZE", 1024))
-        self.rec_duration = 5
+        self.rec_duration = 5  # seconds
 
         self.mongo_client = MongoClient(os.getenv("MONGODB_URI"))
         self.db = self.mongo_client[os.getenv("DB_NAME")]
@@ -59,25 +59,46 @@ class VoiceAssistant:
                 logger.info(f"Truncating audio from {len(normalized)} to {target_length}")
                 normalized = normalized[:target_length]
 
-            # Extract MFCC features with fixed parameters
+            # Extract more comprehensive features
             mfcc = librosa.feature.mfcc(
                 y=normalized,
                 sr=self.sample_rate,
-                n_mfcc=20,
+                n_mfcc=40,  # Increased from 20 to 40 for more detail
                 hop_length=512,
                 n_fft=2048
             )
-            logger.info(f"MFCC shape: {mfcc.shape}")
-
-            # Compute statistics over time
-            mean_features = np.mean(mfcc, axis=1)
-            std_features = np.std(mfcc, axis=1)
             
-            # Combine features
-            embedding = np.concatenate([mean_features, std_features])
+            # Add delta features
+            mfcc_delta = librosa.feature.delta(mfcc)
+            mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
+            
+            # Extract pitch features
+            f0 = librosa.yin(normalized, fmin=librosa.note_to_hz('C2'), 
+                           fmax=librosa.note_to_hz('C7'),
+                           sr=self.sample_rate)
+            
+            # Compute statistics over time for all features
+            mean_mfcc = np.mean(mfcc, axis=1)
+            std_mfcc = np.std(mfcc, axis=1)
+            mean_delta = np.mean(mfcc_delta, axis=1)
+            std_delta = np.std(mfcc_delta, axis=1)
+            mean_delta2 = np.mean(mfcc_delta2, axis=1)
+            std_delta2 = np.std(mfcc_delta2, axis=1)
+            
+            # Pitch statistics
+            mean_f0 = np.mean(f0)
+            std_f0 = np.std(f0)
+            
+            # Combine all features
+            embedding = np.concatenate([
+                mean_mfcc, std_mfcc,
+                mean_delta, std_delta,
+                mean_delta2, std_delta2,
+                [mean_f0], [std_f0]
+            ])
             
             # Normalize final embedding
-            embedding = (embedding - np.mean(embedding)) / np.std(embedding)
+            embedding = (embedding - np.mean(embedding)) / (np.std(embedding) + 1e-10)
             
             logger.info(f"Final embedding shape: {embedding.shape}")
             return embedding
@@ -94,13 +115,13 @@ class VoiceAssistant:
                 return None
     
             best_match = None
-            best_score = -1
-            threshold = 0.5  # Lowered threshold for better matching
+            best_score = float('-inf')
+            threshold = 0.75  # Increased threshold for stricter matching
     
             # Debug log for current embedding
             logger.info(f"Current embedding shape: {embedding.shape}")
-            logger.info(f"Current embedding norm: {np.linalg.norm(embedding)}")
     
+            all_scores = []  # Store all scores for dynamic thresholding
             for profile in self.voice_profiles.find():
                 try:
                     stored = np.array(profile['embeddings'])
@@ -110,23 +131,49 @@ class VoiceAssistant:
                         logger.warning(f"Shape mismatch: stored {stored.shape} vs current {embedding.shape}")
                         continue
     
-                    # Normalize vectors before comparison
-                    embedding_norm = embedding / np.linalg.norm(embedding)
-                    stored_norm = stored / np.linalg.norm(stored)
+                    # Enhanced similarity metrics
+                    cosine_sim = np.dot(embedding, stored) / (np.linalg.norm(embedding) * np.linalg.norm(stored) + 1e-10)
+                    l2_dist = np.linalg.norm(embedding - stored)
+                    correlation = np.corrcoef(embedding, stored)[0, 1]
                     
-                    # Calculate cosine similarity
-                    sim = np.dot(embedding_norm, stored_norm)
-                    logger.info(f"Similarity score with {profile['user_id']}: {sim}")
+                    # Dynamic weighting based on confidence
+                    confidence = abs(cosine_sim)
+                    sim_score = (
+                        0.6 * cosine_sim +  # Increased weight on cosine similarity
+                        0.25 * (1 - l2_dist/np.sqrt(len(embedding))) +  # Reduced weight on L2
+                        0.15 * correlation  # Reduced weight on correlation
+                    )
                     
-                    if sim > best_score:
-                        best_score = sim
+                    all_scores.append((sim_score, profile['user_id']))
+                    
+                    logger.info(f"Detailed scores for {profile['user_id']}:")
+                    logger.info(f"  Cosine similarity: {cosine_sim:.4f}")
+                    logger.info(f"  L2 distance: {l2_dist:.4f}")
+                    logger.info(f"  Correlation: {correlation:.4f}")
+                    logger.info(f"  Confidence: {confidence:.4f}")
+                    logger.info(f"  Final score: {sim_score:.4f}")
+                    
+                    if sim_score > best_score:
+                        best_score = sim_score
                         best_match = profile['user_id']
+                        
                 except Exception as e:
                     logger.error(f"Error comparing with profile {profile['user_id']}: {e}")
                     continue
     
+            # If we have multiple scores, check for ambiguity
+            if len(all_scores) > 1:
+                all_scores.sort(reverse=True)
+                score_diff = all_scores[0][0] - all_scores[1][0]
+                
+                # If the difference between top two scores is too small, reject the match
+                if score_diff < 0.1:  # Minimum score difference threshold
+                    logger.warning("Ambiguous match detected - scores too close")
+                    return None
+    
             logger.info(f"Best match: {best_match} with score: {best_score}")
             return best_match if best_score > threshold else None
+            
         except Exception as e:
             logger.error(f"Speaker identification failed: {e}")
             return None
@@ -147,6 +194,7 @@ class VoiceAssistant:
         try:
             temp_path = "temp.wav"
             write(temp_path, self.sample_rate, audio)
+            print(f"Transcribing audio from {temp_path}")
             result = self.whisper_model.transcribe(temp_path)
             os.remove(temp_path)
             return result['text']
@@ -156,13 +204,17 @@ class VoiceAssistant:
 
     def generate_response(self, query, context=""):
         try:
+            print(f"Generating response for query: {query}")
             prompt = f"Context: {context}\nQuery: {query}\nResponse:"
-            completion = openai.Completion.create(
-                engine="text-davinci-003",
-                prompt=prompt,
+            completion = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful voice assistant created by Selvaraj AI EXPERT you should only answer about AI or Blockchain."},
+                    {"role": "user", "content": prompt}
+                ],
                 max_tokens=150
             )
-            return completion.choices[0].text.strip()
+            return completion.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Response generation failed: {e}")
             return "Sorry, I couldn't generate a response."
